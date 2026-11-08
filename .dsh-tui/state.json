@@ -1,0 +1,15 @@
+{
+  "services": {
+    "web": {
+      "pid": 14548,
+      "startedAt": 1794126443646,
+      "command": "dsh",
+      "args": [
+        "web",
+        "--port",
+        "3080"
+      ],
+      "logPath": "C:\\Users\\twlz9\\Documents\\deepseek-harness\\DSH管理\\.dsh-tui\\logs\\web.log"
+    }
+  }
+}
