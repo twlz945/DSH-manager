@@ -19,6 +19,9 @@ import {
   renderScreen,
   formatDuration,
   createKeyDecoder,
+  compareVersions,
+  checkDshUpdate,
+  installDshUpdate,
 } from '../dsh-tui.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -174,6 +177,124 @@ test('配置合并：缺失字段使用安全默认值', () => {
   assert.equal(svc.startTimeoutMs, 20000);
   assert.equal(svc.args[0], undefined);
 });
+
+// ---------------------------------------------------------------- update / config CLI
+
+test('compareVersions 处理 rc 与数字段', () => {
+  assert.equal(compareVersions('0.2.1-rc.5', '0.2.2-rc.1'), -1);
+  assert.equal(compareVersions('0.2.2-rc.1', '0.2.2-rc.1'), 0);
+  assert.equal(compareVersions('1.0.0', '1.0.0-rc.1'), 1);
+  assert.equal(compareVersions('0.10.0', '0.9.9'), 1);
+  assert.equal(compareVersions('v1.2.3', '1.2.3'), 0);
+});
+
+test('checkDshUpdate 用注入的 capture 检查已安装/最新版本', async () => {
+  const calls = [];
+  const capture = (command, args) => {
+    calls.push([command, ...args]);
+    if (command === 'dsh') return '0.2.1-rc.5\n';
+    if (command === 'npm') return '0.2.2-rc.1\n';
+    return null;
+  };
+  const res = await checkDshUpdate({ capture });
+  assert.equal(res.installed, '0.2.1-rc.5');
+  assert.equal(res.latest, '0.2.2-rc.1');
+  assert.equal(res.updateAvailable, true);
+  assert.equal(res.error, null);
+  assert.ok(calls.some((c) => c[0] === 'npm' && c.includes('@deepseek-ai/dsh')));
+});
+
+test('checkDshUpdate：已最新不更新，npm 失败给出错误', async () => {
+  const upToDate = await checkDshUpdate({
+    capture: (command) => (command === 'dsh' ? '0.2.2-rc.1' : '0.2.2-rc.1'),
+  });
+  assert.equal(upToDate.updateAvailable, false);
+  assert.equal(upToDate.error, null);
+
+  const failing = await checkDshUpdate({
+    capture: (command) => (command === 'dsh' ? '0.2.1-rc.5' : null),
+  });
+  assert.ok(failing.error, 'npm 查询失败应返回 error');
+  assert.equal(failing.installed, '0.2.1-rc.5');
+  assert.equal(failing.latest, null);
+});
+
+test('installDshUpdate 执行 npm install -g 并返回退出码', async () => {
+  const { EventEmitter } = await import('node:events');
+  const spawned = [];
+  const spawnFn = (command, args, options) => {
+    spawned.push({ command, args, options });
+    const child = new EventEmitter();
+    child.kill = () => {};
+    setImmediate(() => child.emit('close', 0));
+    return child;
+  };
+  const res = await installDshUpdate({ stdio: 'ignore', spawnFn });
+  assert.equal(res.ok, true);
+  assert.equal(res.code, 0);
+  assert.equal(spawned[0].command, 'npm');
+  assert.deepEqual(spawned[0].args, ['install', '-g', '@deepseek-ai/dsh@latest']);
+});
+
+test('config path/show/set：更新字段且保留未知字段', async () => {
+  const dir = tmpDir();
+  const cfgPath = path.join(dir, 'dsh-tui.config.json');
+  fs.writeFileSync(cfgPath, JSON.stringify({
+    meta: { keep: true },
+    services: [{
+      id: 'web',
+      name: 'Web',
+      command: 'dsh',
+      args: ['web'],
+      port: 3080,
+      custom: 'keep-me',
+    }],
+  }, null, 2));
+
+  const p = await runCli(['--config', cfgPath, 'config', 'path']);
+  assert.equal(p.code, 0, p.stdout);
+  assert.equal(p.stdout.trim(), cfgPath);
+
+  const show = await runCli(['--config', cfgPath, 'config', 'show']);
+  assert.equal(show.code, 0, show.stdout);
+  assert.equal(JSON.parse(show.stdout).services[0].name, 'Web');
+
+  const setName = await runCli(['--config', cfgPath, 'config', 'set', 'web', 'name', 'Renamed Web']);
+  assert.equal(setName.code, 0, setName.stdout);
+  const setPort = await runCli(['--config', cfgPath, 'config', 'set', 'web', 'port', '3999']);
+  assert.equal(setPort.code, 0, setPort.stdout);
+  const setArgs = await runCli(['--config', cfgPath, 'config', 'set', 'web', 'args', '["web","--port","3999"]']);
+  assert.equal(setArgs.code, 0, setArgs.stdout);
+  const setEnv = await runCli(['--config', cfgPath, 'config', 'set', 'web', 'env', '{"FOO":"bar"}']);
+  assert.equal(setEnv.code, 0, setEnv.stdout);
+
+  const raw = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+  assert.deepEqual(raw.meta, { keep: true });
+  assert.equal(raw.services[0].custom, 'keep-me');
+  assert.equal(raw.services[0].name, 'Renamed Web');
+  assert.equal(raw.services[0].port, 3999);
+  assert.deepEqual(raw.services[0].args, ['web', '--port', '3999']);
+  assert.deepEqual(raw.services[0].env, { FOO: 'bar' });
+});
+
+test('config set 非法字段/值/服务以退出码 1 失败且不改写文件', async () => {
+  const dir = tmpDir();
+  const cfgPath = writeConfig(dir, [{ id: 'web', command: 'dsh', args: ['web'], port: 3080 }]);
+  const before = fs.readFileSync(cfgPath, 'utf8');
+
+  const cases = [
+    ['config', 'set', 'web', 'bogus', 'x'],
+    ['config', 'set', 'web', 'port', 'not-a-number'],
+    ['config', 'set', 'web', 'args', 'not-json'],
+    ['config', 'set', 'missing', 'name', 'x'],
+  ];
+  for (const args of cases) {
+    const res = await runCli(['--config', cfgPath, ...args]);
+    assert.equal(res.code, 1, `${args.join(' ')} 应失败: ${res.stdout}`);
+  }
+  assert.equal(fs.readFileSync(cfgPath, 'utf8'), before, '失败时不得改写配置');
+});
+
 
 // ---------------------------------------------------------------- probing
 
@@ -484,3 +605,54 @@ test('TUI 冒烟：可启动、渲染服务列表、读取按键并干净退出'
   assert.match(text, /47881/);
   assert.match(text, /\[q\] 退出/);
 });
+
+test('TUI 编辑配置：挂起、调用编辑器、重载并显示新配置', async () => {
+  const dir = tmpDir();
+  const cfgPath = writeConfig(dir, [
+    {
+      id: 'svc',
+      name: 'Before Edit',
+      command: process.execPath,
+      args: ['-e', 'setInterval(() => {}, 1000)'],
+      port: 47882,
+      host: '127.0.0.1',
+      startTimeoutMs: 3000,
+    },
+  ]);
+  const editorScript = path.join(dir, 'editor.mjs');
+  fs.writeFileSync(
+    editorScript,
+    [
+      "import fs from 'node:fs';",
+      'const file = process.argv[2];',
+      "const data = JSON.parse(fs.readFileSync(file, 'utf8'));",
+      "data.services[0].name = 'After Edit';",
+      "fs.writeFileSync(file, JSON.stringify(data, null, 2));",
+    ].join('\n'),
+  );
+  const keysFile = path.join(dir, 'keys.txt');
+  fs.writeFileSync(keysFile, 'e');
+  const outFile = path.join(dir, 'edit.out');
+  const fdIn = fs.openSync(keysFile, 'r');
+  const fdOut = fs.openSync(outFile, 'w');
+  const child = spawn(process.execPath, [TUI, '--config', cfgPath], {
+    stdio: [fdIn, fdOut, fdOut],
+    windowsHide: true,
+    env: {
+      ...process.env,
+      DSH_TUI_FORCE_TTY: '1',
+      DSH_TUI_EDITOR: `"${process.execPath}" "${editorScript}"`,
+    },
+  });
+  let text = '';
+  const ok = await waitFor(() => {
+    try { text = fs.readFileSync(outFile, 'utf8'); } catch {}
+    return /After Edit/.test(text) && /配置已重新加载/.test(text);
+  }, 10000, 150);
+  try { child.kill('SIGKILL'); } catch {}
+  try { fs.closeSync(fdIn); } catch {}
+  try { fs.closeSync(fdOut); } catch {}
+  const plain = text.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '');
+  assert.equal(ok, true, plain.slice(0, 800));
+});
+

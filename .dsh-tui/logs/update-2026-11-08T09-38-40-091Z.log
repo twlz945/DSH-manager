@@ -1,0 +1,25 @@
+npm warn deprecated node-domexception@1.0.0: Use your platform's native DOMException instead
+npm warn cleanup Failed to remove some directories [
+npm warn cleanup   [
+npm warn cleanup     'C:\\Users\\twlz9\\AppData\\Roaming\\npm\\node_modules\\@deepseek-ai\\.dsh-KQAWHC8H',
+npm warn cleanup     [Error: EPERM: operation not permitted, unlink 'C:\Users\twlz9\AppData\Roaming\npm\node_modules\@deepseek-ai\.dsh-KQAWHC8H\node_modules\@koromix\koffi-win32-x64\win32_x64\koffi.node'] {
+npm warn cleanup       errno: -4048,
+npm warn cleanup       code: 'EPERM',
+npm warn cleanup       syscall: 'unlink',
+npm warn cleanup       path: 'C:\\Users\\twlz9\\AppData\\Roaming\\npm\\node_modules\\@deepseek-ai\\.dsh-KQAWHC8H\\node_modules\\@koromix\\koffi-win32-x64\\win32_x64\\koffi.node'
+npm warn cleanup     }
+npm warn cleanup   ]
+npm warn cleanup ]
+
+added 40 packages, removed 2 packages, and changed 612 packages in 3m
+
+71 packages are looking for funding
+  run `npm fund` for details
+npm warn install-scripts 5 packages have install scripts not yet covered by allowScripts:
+npm warn install-scripts   @deepseek-ai/dsh-subprocess-local@0.2.2-rc.1 (postinstall: node scripts/ensure-spawn-helper.mjs)
+npm warn install-scripts   koffi@3.1.1 (install: node ./cnoke.cjs -P . -D src/koffi --prebuild --release)
+npm warn install-scripts   node-pty@1.2.0-beta.15 (install: node scripts/prebuild.js || node-gyp rebuild; postinstall: node scripts/post-install.js)
+npm warn install-scripts   @google/genai@2.21.0 (preinstall: echo 'preinstall: no-op')
+npm warn install-scripts   protobufjs@7.6.6 (postinstall: node scripts/postinstall)
+npm warn install-scripts
+npm warn install-scripts Run `npm install -g --allow-scripts=@deepseek-ai/dsh-subprocess-local,koffi,node-pty,@google/genai,protobufjs` to allow these scripts once, or `npm config set allow-scripts=@deepseek-ai/dsh-subprocess-local,koffi,node-pty,@google/genai,protobufjs --location=user` to allow them for all global installs.

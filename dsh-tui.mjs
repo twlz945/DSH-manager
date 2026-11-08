@@ -21,7 +21,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { StringDecoder } from 'node:string_decoder';
 
-const VERSION = '1.0.0';
+const VERSION = '1.1.0';
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const IS_WIN = process.platform === 'win32';
 const DEFAULT_CONFIG_PATH = path.join(SCRIPT_DIR, 'dsh-tui.config.json');
@@ -167,7 +167,7 @@ function pidAlive(pid) {
 }
 
 /** 运行命令并把 stdout/stderr 捕获到临时文件（避免管道依赖，沙箱下也稳定）。 */
-function captureSync(command, args, timeout = 5000) {
+function captureSync(command, args, timeout = 5000, { shell = false } = {}) {
   const file = path.join(
     os.tmpdir(),
     `dsh-tui-cap-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.log`,
@@ -179,6 +179,7 @@ function captureSync(command, args, timeout = 5000) {
       stdio: ['ignore', fd, fd],
       windowsHide: true,
       timeout,
+      shell,
     });
     fs.closeSync(fd);
     fd = undefined;
@@ -192,6 +193,242 @@ function captureSync(command, args, timeout = 5000) {
     }
     try { fs.unlinkSync(file); } catch {}
   }
+}
+
+// ------------------------------------------------------------------ DSH update
+
+const DSH_PACKAGE = '@deepseek-ai/dsh';
+
+/** 比较两个版本号（支持 prerelease），a<b 返回 -1，相等 0，a>b 返回 1。 */
+export function compareVersions(a, b) {
+  const parse = (v) => {
+    const m = String(v ?? '').trim().replace(/^v/i, '').match(/^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/);
+    if (!m) return null;
+    return {
+      nums: [Number(m[1]), Number(m[2]), Number(m[3])],
+      pre: m[4] ? m[4].split('.') : [],
+    };
+  };
+  const pa = parse(a);
+  const pb = parse(b);
+  if (!pa || !pb) return 0;
+  for (let i = 0; i < 3; i++) {
+    if (pa.nums[i] !== pb.nums[i]) return pa.nums[i] < pb.nums[i] ? -1 : 1;
+  }
+  if (pa.pre.length === 0 && pb.pre.length === 0) return 0;
+  if (pa.pre.length === 0) return 1;
+  if (pb.pre.length === 0) return -1;
+  const len = Math.max(pa.pre.length, pb.pre.length);
+  for (let i = 0; i < len; i++) {
+    const x = pa.pre[i];
+    const y = pb.pre[i];
+    if (x === undefined) return -1;
+    if (y === undefined) return 1;
+    if (x === y) continue;
+    const nx = /^\d+$/.test(x);
+    const ny = /^\d+$/.test(y);
+    if (nx && ny) return Number(x) < Number(y) ? -1 : 1;
+    if (nx) return -1;
+    if (ny) return 1;
+    return x < y ? -1 : 1;
+  }
+  return 0;
+}
+
+function parseVersionOutput(text) {
+  if (!text) return null;
+  const matches = String(text).match(/\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?/g);
+  return matches && matches.length ? matches[matches.length - 1] : null;
+}
+
+function defaultCapture(command, args) {
+  return captureSync(command, args, 20000, { shell: needsShell(command) });
+}
+
+/**
+ * 检查 DSH 更新：读取 `dsh --version` 与 npm 上的最新版本。
+ * capture 可注入（测试用），签名 (command, args) => string|null。
+ */
+export async function checkDshUpdate({ capture = defaultCapture } = {}) {
+  const result = { installed: null, latest: null, updateAvailable: false, error: null };
+  try {
+    result.installed = parseVersionOutput(capture('dsh', ['--version']));
+  } catch (err) {
+    result.error = `无法读取 dsh 版本：${err.message}`;
+  }
+  if (!result.installed) {
+    result.error = result.error ?? '无法解析 dsh --version 输出（dsh 可能不在 PATH）';
+  }
+  try {
+    result.latest = parseVersionOutput(capture('npm', ['view', DSH_PACKAGE, 'version']));
+  } catch (err) {
+    result.error = result.error ?? `无法查询 npm 最新版本：${err.message}`;
+  }
+  if (!result.latest) {
+    result.error = result.error ?? 'npm 未返回版本（检查网络或 registry 配置）';
+  }
+  if (result.installed && result.latest) {
+    result.updateAvailable = compareVersions(result.latest, result.installed) > 0;
+  }
+  return result;
+}
+
+/**
+ * 执行 `npm install -g @deepseek-ai/dsh@latest`。
+ * stdio 默认 inherit（CLI 可见进度）；TUI 传入 logPath 时输出写入日志文件。
+ */
+export function installDshUpdate({
+  stdio = 'inherit',
+  logPath = null,
+  timeoutMs = 10 * 60 * 1000,
+  spawnFn = spawn,
+} = {}) {
+  return new Promise((resolve) => {
+    let outFd = null;
+    let stdioOption = stdio;
+    if (logPath) {
+      try {
+        fs.mkdirSync(path.dirname(logPath), { recursive: true });
+        outFd = fs.openSync(logPath, 'w');
+        stdioOption = ['ignore', outFd, outFd];
+      } catch (err) {
+        resolve({ ok: false, code: null, logPath, error: `无法创建更新日志：${err.message}` });
+        return;
+      }
+    }
+    let child;
+    try {
+      child = spawnFn('npm', ['install', '-g', `${DSH_PACKAGE}@latest`], {
+        shell: needsShell('npm'),
+        stdio: stdioOption,
+        windowsHide: true,
+      });
+    } catch (err) {
+      if (outFd !== null) { try { fs.closeSync(outFd); } catch {} }
+      resolve({ ok: false, code: null, logPath, error: err.message });
+      return;
+    }
+    let done = false;
+    const finish = (result) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      if (outFd !== null) {
+        try { fs.closeSync(outFd); } catch {}
+        outFd = null;
+      }
+      resolve(result);
+    };
+    const timer = setTimeout(() => {
+      try { child.kill('SIGKILL'); } catch {}
+      finish({ ok: false, code: null, logPath, error: `更新超时（${Math.round(timeoutMs / 1000)} 秒）` });
+    }, timeoutMs);
+    timer.unref?.();
+    child.once('error', (error) => finish({ ok: false, code: null, logPath, error: error.message }));
+    child.once('close', (code) => finish({
+      ok: code === 0,
+      code,
+      logPath,
+      error: code === 0 ? null : `npm 退出码 ${code}`,
+    }));
+  });
+}
+
+// ------------------------------------------------------------------ editor
+
+export function resolveEditor() {
+  const fromEnv = process.env.DSH_TUI_EDITOR || process.env.VISUAL || process.env.EDITOR;
+  if (fromEnv && fromEnv.trim()) return fromEnv.trim();
+  return IS_WIN ? 'notepad' : 'vi';
+}
+
+/** 打开外部编辑器（继承终端），返回 {ok, code, error}。 */
+export function openInEditor(file, { editor = resolveEditor(), spawnFn = spawn } = {}) {
+  return new Promise((resolve) => {
+    const command = `${editor} "${file}"`;
+    let child;
+    try {
+      child = spawnFn(command, { shell: true, stdio: 'inherit', windowsHide: false });
+    } catch (err) {
+      resolve({ ok: false, code: null, error: err.message });
+      return;
+    }
+    let done = false;
+    const finish = (result) => {
+      if (done) return;
+      done = true;
+      resolve(result);
+    };
+    child.once('error', (error) => finish({ ok: false, code: null, error: error.message }));
+    child.once('close', (code) => finish({
+      ok: code === 0,
+      code,
+      error: code === 0 ? null : `编辑器退出码 ${code}`,
+    }));
+  });
+}
+
+// ------------------------------------------------------------------ config editing
+
+const CONFIG_FIELDS = new Set([
+  'name',
+  'command',
+  'args',
+  'port',
+  'host',
+  'url',
+  'cwd',
+  'startTimeoutMs',
+  'env',
+]);
+
+function readRawConfig(configPath) {
+  const text = fs.readFileSync(configPath, 'utf8');
+  const raw = JSON.parse(text);
+  if (!raw || typeof raw !== 'object' || !Array.isArray(raw.services)) {
+    throw new Error('配置文件缺少 services 数组');
+  }
+  return raw;
+}
+
+function parseConfigValue(field, rawValue) {
+  if (field === 'args') {
+    const parsed = JSON.parse(rawValue);
+    if (!Array.isArray(parsed)) throw new Error('args 必须是 JSON 数组，例如 ["web","--port","3080"]');
+    return parsed.map(String);
+  }
+  if (field === 'env') {
+    const parsed = JSON.parse(rawValue);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('env 必须是 JSON 对象，例如 {"FOO":"bar"}');
+    }
+    return Object.fromEntries(Object.entries(parsed).map(([k, v]) => [String(k), String(v)]));
+  }
+  if (field === 'port' || field === 'startTimeoutMs') {
+    const value = Number(rawValue);
+    if (!Number.isInteger(value)) throw new Error(`${field} 必须是整数`);
+    return value;
+  }
+  return String(rawValue);
+}
+
+/** 修改配置文件中某个服务的字段；保留未知字段，先校验后落盘。 */
+export function setServiceField(configPath, id, field, rawValue) {
+  if (!CONFIG_FIELDS.has(field)) {
+    throw new Error(`不支持的字段: ${field}（支持 ${[...CONFIG_FIELDS].join(', ')}）`);
+  }
+  const resolved = path.resolve(configPath);
+  const raw = readRawConfig(resolved);
+  const index = raw.services.findIndex((svc) => svc && svc.id === id);
+  if (index < 0) throw new Error(`找不到服务 "${id}"`);
+  const value = parseConfigValue(field, rawValue);
+  // 用规范化逻辑校验（command 非空、port 范围、startTimeoutMs 下限等）。
+  normalizeService({ ...raw.services[index], [field]: value }, index, path.dirname(resolved));
+  raw.services[index] = { ...raw.services[index], [field]: value };
+  const tmp = `${resolved}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, `${JSON.stringify(raw, null, 2)}\n`);
+  fs.renameSync(tmp, resolved);
+  return { id, field, value };
 }
 
 /** 查询监听某端口的进程 PID（Windows: netstat / POSIX: lsof|ss）。 */
@@ -679,7 +916,7 @@ export function renderScreen(model, opts = {}) {
   }
   lines.push(msgLine);
 
-  const hint = '[s] 启动   [r] 重启   [x] 停止   [↑/↓] 选择   [q] 退出';
+  const hint = '[s] 启动  [r] 重启  [x] 停止  [e] 编辑参数  [u] 更新  [↑/↓] 选择  [q] 退出';
   lines.push(dim(truncate(hint, width)));
   if (model.url) lines.push(dim(truncate(`URL: ${model.url}`, width)));
 
@@ -767,24 +1004,26 @@ export function createKeyDecoder(onKey, { escDelayMs = 40 } = {}) {
   };
 }
 
-async function runTui(config, runtimeDir, warning) {
+async function runTui(config, runtimeDir, warning, configPath) {
   const forceTty = process.env.DSH_TUI_FORCE_TTY === '1';
   if ((!process.stdin.isTTY || !process.stdout.isTTY) && !forceTty) {
     console.error('dsh-tui: 当前不是交互式终端，无法进入 TUI。可用 "node dsh-tui.mjs status" 查看状态。');
     process.exit(1);
   }
 
-  const services = config.services;
+  let services = config.services;
   let selected = 0;
   let offset = 0;
   let statuses = new Map();
   let message = warning
     ? { kind: 'err', text: warning }
-    : { kind: 'info', text: '就绪：s 启动 / r 重启 / x 停止' };
+    : { kind: 'info', text: '就绪：s 启动 / r 重启 / x 停止 / e 编辑参数 / u 更新' };
   let busy = null;
   let confirm = null;
   let refreshing = false;
   let stopped = false;
+  let suspended = false;
+  let updatePending = null;
   let spinnerFrame = 0;
   let timer = null;
   let spinner = null;
@@ -797,7 +1036,7 @@ async function runTui(config, runtimeDir, warning) {
   }
 
   function paint() {
-    if (stopped) return;
+    if (stopped || suspended) return;
     const { cols, rows } = terminalSize();
     const svcList = services.map((svc, i) => {
       const st = statuses.get(svc.id);
@@ -825,7 +1064,7 @@ async function runTui(config, runtimeDir, warning) {
   }
 
   async function refreshAll() {
-    if (refreshing || stopped) return;
+    if (refreshing || stopped || suspended) return;
     refreshing = true;
     try {
       const results = await Promise.all(
@@ -845,7 +1084,7 @@ async function runTui(config, runtimeDir, warning) {
           }
         }),
       );
-      if (!stopped) {
+      if (!stopped && !suspended) {
         statuses = new Map(results.map((r) => [r.id, r]));
         paint();
       }
@@ -888,6 +1127,99 @@ async function runTui(config, runtimeDir, warning) {
     await refreshAll();
   }
 
+  function pauseTimers() {
+    if (timer) clearInterval(timer);
+    if (spinner) clearInterval(spinner);
+    timer = null;
+    spinner = null;
+  }
+
+  function startTimers() {
+    timer = setInterval(refreshAll, 1000);
+    spinner = setInterval(() => {
+      spinnerFrame += 1;
+      if (busy) paint();
+    }, 400);
+  }
+
+  async function editConfig() {
+    if (busy || suspended) return;
+    busy = '等待编辑器';
+    paint();
+    suspended = true;
+    pauseTimers();
+    try { process.stdin.setRawMode(false); } catch {}
+    try { process.stdin.pause(); } catch {}
+    write('\x1b[?25h\x1b[?1049l');
+    const res = await openInEditor(configPath);
+    const loaded = loadConfig(configPath);
+    services = loaded.config.services;
+    statuses = new Map();
+    selected = 0;
+    offset = 0;
+    busy = null;
+    suspended = false;
+    if (loaded.warning) {
+      message = { kind: 'err', text: loaded.warning };
+    } else if (res.ok) {
+      message = { kind: 'ok', text: '配置已重新加载，重启服务后生效' };
+    } else {
+      message = { kind: 'err', text: `${res.error}；已重新加载配置` };
+    }
+    write('\x1b[?1049h\x1b[?25l');
+    try { process.stdin.setRawMode(true); } catch {}
+    await refreshAll();
+    paint();
+    startTimers();
+    process.stdin.resume();
+  }
+
+  async function updateFlow() {
+    if (busy || suspended) return;
+    if (updatePending) {
+      const target = updatePending;
+      updatePending = null;
+      busy = '更新中';
+      paint();
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const logPath = path.join(runtimeDir, 'logs', `update-${stamp}.log`);
+      const res = await installDshUpdate({ logPath });
+      if (!res.ok) {
+        message = { kind: 'err', text: `更新失败：${res.error}（日志 ${logPath}）` };
+      } else {
+        const after = await checkDshUpdate();
+        message = {
+          kind: 'ok',
+          text: `更新完成：${target.installed} → ${after.installed ?? target.latest}；重启服务后生效`,
+        };
+      }
+      busy = null;
+      await refreshAll();
+      paint();
+      return;
+    }
+    busy = '检查更新';
+    paint();
+    const check = await checkDshUpdate();
+    busy = null;
+    if (check.error) {
+      message = { kind: 'err', text: `检查更新失败：${check.error}` };
+      paint();
+      return;
+    }
+    if (!check.updateAvailable) {
+      message = { kind: 'ok', text: `已是最新版本（${check.installed}）` };
+      paint();
+      return;
+    }
+    updatePending = { installed: check.installed, latest: check.latest };
+    message = {
+      kind: 'info',
+      text: `已安装 ${check.installed}，最新 ${check.latest}；再按 u 确认更新（不自动重启服务，Esc 取消）`,
+    };
+    paint();
+  }
+
   function cleanup() {
     if (stopped) return;
     stopped = true;
@@ -915,6 +1247,12 @@ async function runTui(config, runtimeDir, warning) {
 
   const decoder = createKeyDecoder((key) => {
     if (busy || stopped) return;
+    if (key === 'esc' && updatePending) {
+      updatePending = null;
+      message = { kind: 'info', text: '已取消更新' };
+      paint();
+      return;
+    }
     if (key === 'q' || key === 'esc' || key === '\x03') quit(0);
     else if (key === 'up' || key === 'k') {
       selected = (selected - 1 + services.length) % services.length;
@@ -927,6 +1265,8 @@ async function runTui(config, runtimeDir, warning) {
     } else if (key === 's' || key === '\r') perform('start');
     else if (key === 'r') perform('restart');
     else if (key === 'x' || key === '\x7f') perform('stop');
+    else if (key === 'e') editConfig();
+    else if (key === 'u') updateFlow();
   });
   process.stdin.on('data', (chunk) => decoder.feed(chunk));
 
@@ -938,11 +1278,7 @@ async function runTui(config, runtimeDir, warning) {
   write('\x1b[?1049h\x1b[?25l');
   await refreshAll();
   paint();
-  timer = setInterval(refreshAll, 1000);
-  spinner = setInterval(() => {
-    spinnerFrame += 1;
-    if (busy) paint();
-  }, 400);
+  startTimers();
   // 首帧渲染完成后再开始读键，避免启动瞬间的输入在绘制前触发退出。
   process.stdin.resume();
 }
@@ -950,20 +1286,23 @@ async function runTui(config, runtimeDir, warning) {
 // ------------------------------------------------------------------ CLI
 
 function parseArgs(argv) {
-  const opts = { configPath: null, command: 'tui', id: null, help: false, version: false };
+  const opts = { configPath: null, command: 'tui', id: null, help: false, version: false, check: false, rest: [] };
   const rest = [];
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--config' || arg === '-c') {
       opts.configPath = argv[++i];
       if (!opts.configPath) throw new Error('--config 需要一个路径');
-    } else if (arg === '--help' || arg === '-h') opts.help = true;
+    } else if (arg === '--check') opts.check = true;
+    else if (arg === '--help' || arg === '-h') opts.help = true;
     else if (arg === '--version' || arg === '-V') opts.version = true;
     else rest.push(arg);
   }
+  const allowed = ['tui', 'status', 'start', 'stop', 'restart', 'list', 'update', 'config'];
   opts.command = rest[0] ?? 'tui';
   opts.id = rest[1] ?? null;
-  if (!['tui', 'status', 'start', 'stop', 'restart', 'list'].includes(opts.command)) {
+  opts.rest = rest.slice(1);
+  if (!allowed.includes(opts.command)) {
     throw new Error(`未知命令: ${opts.command}`);
   }
   return opts;
@@ -973,24 +1312,103 @@ function printHelp() {
   console.log(`dsh-tui ${VERSION} — DSH 服务管理 TUI
 
 用法:
-  node dsh-tui.mjs [--config 文件]                 进入全屏 TUI
-  node dsh-tui.mjs [--config 文件] status          输出状态 JSON
-  node dsh-tui.mjs [--config 文件] start <id>      启动服务
-  node dsh-tui.mjs [--config 文件] stop <id>       停止服务
-  node dsh-tui.mjs [--config 文件] restart <id>    重启服务
-  node dsh-tui.mjs [--config 文件] list            列出服务
+  node dsh-tui.mjs [--config 文件]                    进入全屏 TUI
+  node dsh-tui.mjs [--config 文件] status             输出状态 JSON
+  node dsh-tui.mjs [--config 文件] start <id>         启动服务
+  node dsh-tui.mjs [--config 文件] stop <id>          停止服务
+  node dsh-tui.mjs [--config 文件] restart <id>       重启服务
+  node dsh-tui.mjs [--config 文件] list               列出服务
+  node dsh-tui.mjs update [--check]                   检查/执行 DSH 全局更新（npm）
+  node dsh-tui.mjs [--config 文件] config path        显示配置文件路径
+  node dsh-tui.mjs [--config 文件] config show        显示配置 JSON
+  node dsh-tui.mjs [--config 文件] config edit        用外部编辑器修改配置
+  node dsh-tui.mjs [--config 文件] config set <id> <字段> <值>
+                                                     修改启动参数（args/env 用 JSON）
 
 选项:
   -c, --config <路径>   配置文件（默认 ${DEFAULT_CONFIG_PATH}）
+  --check               仅检查更新，不安装
   -h, --help            显示帮助
   -V, --version         显示版本
 
 TUI 按键:
-  ↑/↓ 或 k/j  选择服务    s/Enter  启动    r  重启    x  停止    q  退出
+  ↑/↓ 或 k/j  选择服务    s/Enter  启动    r  重启    x  停止
+  e  编辑启动参数（外部编辑器，保存后热重载）
+  u  检查/执行 DSH 更新（更新后需手动重启服务）
+  q/Esc  退出
   停止/重启外部实例需在 3 秒内再按一次 x/r 确认。
 
-服务以 detached 方式常驻，退出 TUI 不会停止服务。`);
+版本更新只提示“重启服务后生效”，不会自动停止或重启任何服务。`);
 }
+
+async function runUpdateCommand(opts) {
+  const check = await checkDshUpdate();
+  if (opts.check) {
+    console.log(JSON.stringify(check, null, 2));
+    process.exit(check.error ? 1 : 0);
+  }
+  if (check.error) {
+    console.error(`更新检查失败：${check.error}`);
+    process.exit(1);
+  }
+  if (!check.updateAvailable) {
+    console.log(`已是最新版本（${check.installed}）`);
+    return;
+  }
+  console.log(`已安装 ${check.installed}，最新 ${check.latest}，开始更新…`);
+  const res = await installDshUpdate();
+  if (!res.ok) {
+    console.error(`更新失败：${res.error}${res.logPath ? `（日志：${res.logPath}）` : ''}`);
+    process.exit(1);
+  }
+  const after = await checkDshUpdate();
+  console.log(`更新完成：${check.installed} → ${after.installed ?? check.latest}；重启服务后生效。`);
+}
+
+async function runConfigCommand(opts, resolvedPath) {
+  const sub = opts.rest[0];
+  if (sub === 'path') {
+    console.log(resolvedPath);
+    return;
+  }
+  if (sub === 'show') {
+    try {
+      const raw = readRawConfig(resolvedPath);
+      console.log(JSON.stringify(raw, null, 2));
+    } catch (err) {
+      console.error(`dsh-tui: ${err.message}`);
+      process.exit(1);
+    }
+    return;
+  }
+  if (sub === 'edit') {
+    const res = await openInEditor(resolvedPath);
+    const { warning } = loadConfig(resolvedPath);
+    if (!res.ok) console.error(`dsh-tui: ${res.error}`);
+    if (warning) console.error(`dsh-tui: ${warning}`);
+    if (res.ok && !warning) console.log('配置已保存并重新加载，重启服务后生效。');
+    if (!res.ok) process.exit(1);
+    return;
+  }
+  if (sub === 'set') {
+    const [id, field, value] = opts.rest.slice(1);
+    if (!id || !field || value === undefined) {
+      console.error('用法: node dsh-tui.mjs config set <id> <字段> <值>');
+      process.exit(2);
+    }
+    try {
+      const updated = setServiceField(resolvedPath, id, field, value);
+      console.log(`已更新 ${id}.${field} = ${JSON.stringify(updated.value)}；重启服务后生效。`);
+    } catch (err) {
+      console.error(`dsh-tui: ${err.message}`);
+      process.exit(1);
+    }
+    return;
+  }
+  console.error('用法: node dsh-tui.mjs config path|show|edit|set <id> <字段> <值>');
+  process.exit(2);
+}
+
 
 function statusReport(config, configPath, runtimeDir, warning) {
   return Promise.all(
@@ -1043,8 +1461,16 @@ async function main() {
   const { config, warning, path: resolvedPath } = loadConfig(configPath);
   const runtimeDir = path.join(path.dirname(resolvedPath), '.dsh-tui');
 
+  if (opts.command === 'update') {
+    await runUpdateCommand(opts);
+    return;
+  }
+  if (opts.command === 'config') {
+    await runConfigCommand(opts, resolvedPath);
+    return;
+  }
   if (opts.command === 'tui') {
-    await runTui(config, runtimeDir, warning);
+    await runTui(config, runtimeDir, warning, resolvedPath);
     return;
   }
   if (opts.command === 'list') {

@@ -6,7 +6,9 @@
 - 纯 Node.js（≥ 18），无需安装任何依赖
 - 可配置多个服务（列表）
 - 能识别并接管手动启动的实例（按端口 owner PID 终止）
-- 附带命令行模式，方便脚本调用
+- 一键检查/执行 DSH 全局更新（npm），只提示重启、不打断服务
+- 用外部编辑器改启动参数，保存后热重载配置
+- 附带命令行模式（status/start/stop/update/config），方便脚本调用
 
 > ⚠️ 默认的 `web` 服务通常就是**当前正在使用的 DSH GUI 宿主**：停止/重启它会让
 > 当前页面和本会话断开。TUI 对停止/重启外部实例有 3 秒内二次确认；如果不想影响
@@ -33,9 +35,12 @@ node dsh-tui.mjs
 | `s` / `Enter` | 启动选中的服务 |
 | `r` | 重启（先停后起） |
 | `x` / `Backspace` | 停止选中的服务 |
+| `e` | 用外部编辑器修改启动参数，保存后热重载 |
+| `u` | 检查更新；有新版时再按一次 `u` 执行更新 |
 | `q` / `Esc` / `Ctrl+C` | 退出 TUI（服务继续运行） |
 
 当端口被**外部启动**的进程占用时，停止/重启需要在 3 秒内再按一次确认，防止误杀。
+更新检查结果出现后，`Esc` 用于取消待执行的更新。
 
 启动/停止期间底部显示进度；每 1 秒自动刷新状态。
 
@@ -52,6 +57,7 @@ node dsh-tui.mjs
 
 - `.dsh-tui/state.json`：各服务的 PID、启动时间、日志路径
 - `.dsh-tui/logs/<id>.log`：该服务的 stdout/stderr
+- `.dsh-tui/logs/update-<时间>.log`：DSH 更新输出
 
 ## 命令行模式
 
@@ -61,14 +67,28 @@ node dsh-tui.mjs list                   :: 列出配置中的服务
 node dsh-tui.mjs start web              :: 启动
 node dsh-tui.mjs stop web               :: 停止
 node dsh-tui.mjs restart web            :: 重启
+node dsh-tui.mjs update --check         :: 只检查 DSH 更新（JSON）
+node dsh-tui.mjs update                 :: 检查并执行 npm 全局更新
+node dsh-tui.mjs config path            :: 配置文件路径
+node dsh-tui.mjs config show            :: 输出配置 JSON
+node dsh-tui.mjs config edit            :: 用外部编辑器修改配置
+node dsh-tui.mjs config set web args '["web","--port","3090"]'
 node dsh-tui.mjs --config my.json start web
 ```
+
+`update` 只更新 npm 全局包 `@deepseek-ai/dsh@latest`，**不会停止或重启任何服务**；
+更新完成后需要手动按 `r` 重启服务才会用上新版本。
+
+`config set` 支持的字段：`name`、`command`、`args`、`port`、`host`、`url`、`cwd`、
+`startTimeoutMs`、`env`。其中 `args` 必须是 JSON 数组、`env` 必须是 JSON 对象、
+`port`/`startTimeoutMs` 必须是整数。写入前会做完整校验，并保留配置文件里其它
+未知字段与其它服务。
 
 `status` 的 JSON 结构：
 
 ```json
 {
-  "version": "1.0.0",
+  "version": "1.1.0",
   "config": "...\\dsh-tui.config.json",
   "runtimeDir": "...\\.dsh-tui",
   "warning": null,
@@ -90,6 +110,24 @@ node dsh-tui.mjs --config my.json start web
   ]
 }
 ```
+
+## 更新 DSH
+
+TUI 中按 `u`：先显示「已安装版本 / npm 最新版本」；有新版时再按一次 `u` 执行
+`npm install -g @deepseek-ai/dsh@latest`。更新输出写入
+`.dsh-tui/logs/update-<时间>.log`，失败时消息栏会显示错误和日志路径。
+网络不可用、npm 不存在或权限不足都会以可读错误呈现，不影响 TUI 继续使用。
+更新完成后只提示「重启服务后生效」，不会自动停止或重启任何服务。
+
+## 修改启动参数
+
+TUI 中按 `e` 会临时退出全屏，用外部编辑器打开配置文件，保存退出后自动重载。
+编辑器优先级：`DSH_TUI_EDITOR` → `VISUAL` → `EDITOR` → `notepad`（Windows）/`vi`。
+配置改坏时会回退内置默认配置并显示警告，原文件不会被覆盖。
+
+修改保存后服务不会自动重启；面板上会提示「配置已重新加载，重启服务后生效」，
+需要时按 `r` 重启该服务。也可以直接编辑 `dsh-tui.config.json`，或使用
+`config set` 命令。
 
 ## 配置
 
